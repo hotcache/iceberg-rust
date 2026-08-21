@@ -23,6 +23,7 @@
 //! [`SnapshotProducer`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use uuid::Uuid;
@@ -275,6 +276,28 @@ pub(crate) struct MergingSnapshotProducer {
     /// commit retry cannot overwrite a manifest an earlier attempt wrote
     /// under the same commit uuid.
     manifest_counter: AtomicU64,
+    /// Cache that survives across commit retries.
+    ///
+    /// When a commit fails due to a concurrent modification and the
+    /// transaction retries, the manifests for *added* files don't change —
+    /// only the filtering of *existing* manifests needs to be redone
+    /// (because the base snapshot changed). Caching the added-file
+    /// manifests avoids rewriting them on every attempt.
+    ///
+    /// The snapshot_id is also cached so that the manifest list writer
+    /// can correctly assign sequence numbers to cached manifests.
+    cache: Mutex<ManifestCache>,
+}
+
+/// Cached state that persists across commit retries.
+#[derive(Default)]
+struct ManifestCache {
+    /// Snapshot ID generated on the first attempt; reused on retries so
+    /// that cached manifests (which carry this ID) remain valid.
+    snapshot_id: Option<i64>,
+    /// Manifests written for newly added data files. These are
+    /// content-stable across retries and can be reused as-is.
+    new_data_manifests: Option<Vec<ManifestFile>>,
 }
 
 impl MergingSnapshotProducer {
@@ -287,6 +310,7 @@ impl MergingSnapshotProducer {
             commit_uuid: Uuid::now_v7(),
             data_sequence_number: None,
             manifest_counter: AtomicU64::new(0),
+            cache: Mutex::new(ManifestCache::default()),
         }
     }
 
@@ -326,12 +350,17 @@ impl MergingSnapshotProducer {
     }
 
     /// Produce manifests, compute summary, and commit a new snapshot.
+    ///
+    /// On the first call, this writes new manifests for added files and
+    /// caches them. On subsequent calls (retries), the cached manifests
+    /// are reused while existing-manifest filtering is always redone
+    /// (because the base snapshot may have changed).
     pub(crate) async fn commit_snapshot(&self, table: &Table) -> Result<ActionCommit> {
         self.validate_data_sequence_number(table)?;
         // Create the SnapshotProducer first so we can use its snapshot_id
         // for new manifests. This ensures the manifest list writer can
         // assign sequence numbers to manifests from this snapshot.
-        let snapshot_producer = SnapshotProducer::new(
+        let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid,
             HashMap::new(),
@@ -339,7 +368,26 @@ impl MergingSnapshotProducer {
         );
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_duplicate_files().await?;
-        let snapshot_id = snapshot_producer.snapshot_id;
+
+        // Reuse a stable snapshot_id across retries. Cached manifests carry
+        // this id, and the manifest list writer requires it to match when
+        // assigning sequence numbers. On the first attempt we take the id
+        // that SnapshotProducer generated; on retries we override it with
+        // the cached one.
+        let snapshot_id = {
+            let mut cache = self.cache.lock().expect("cache lock poisoned");
+            match cache.snapshot_id {
+                Some(id) => {
+                    snapshot_producer.snapshot_id = id;
+                    id
+                }
+                None => {
+                    let id = snapshot_producer.snapshot_id;
+                    cache.snapshot_id = Some(id);
+                    id
+                }
+            }
+        };
 
         // 1. Load existing manifests from the current snapshot.
         let existing_manifests = match table.metadata().current_snapshot() {
@@ -356,7 +404,8 @@ impl MergingSnapshotProducer {
             None => Vec::new(),
         };
 
-        // 2. Filter existing manifests — remove deleted file entries.
+        // 2. Filter existing manifests — always redo on each attempt
+        //    because the base snapshot may have changed after a retry.
         let (mut filtered_manifests, removed_collector) = self
             .filter_manager
             .filter_manifests(
@@ -368,12 +417,27 @@ impl MergingSnapshotProducer {
             )
             .await?;
 
-        // 3. Write a new manifest for added files.
+        // 3. Get cached or write new manifests for added files.
+        //    Added files don't change between retries, so their manifests
+        //    can be safely reused.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self
-                .write_added_manifest(table, snapshot_id, &self.manifest_counter)
-                .await?;
-            filtered_manifests.push(added_manifest);
+            let cached = {
+                let cache = self.cache.lock().expect("cache lock poisoned");
+                cache.new_data_manifests.clone()
+            };
+            let added_manifests = match cached {
+                Some(manifests) => manifests,
+                None => {
+                    let manifest = self
+                        .write_added_manifest(table, snapshot_id, &self.manifest_counter)
+                        .await?;
+                    let manifests = vec![manifest];
+                    let mut cache = self.cache.lock().expect("cache lock poisoned");
+                    cache.new_data_manifests = Some(manifests.clone());
+                    manifests
+                }
+            };
+            filtered_manifests.extend(added_manifests);
         }
 
         // 4. Compute summary (added + removed).
