@@ -211,27 +211,32 @@ pub(crate) async fn validate_data_files_exist(
         ));
     };
 
-    // Collect all live data file paths from the current snapshot.
+    // Build a set of paths we need to find. We remove entries as we find
+    // them and short-circuit once the set is empty, avoiding a full scan
+    // of all manifests for tables with many files.
+    let mut remaining: HashSet<&str> = referenced_data_file_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+
     let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-    let mut live_paths: HashSet<String> = HashSet::new();
 
     for manifest_file in manifest_list.entries() {
+        if remaining.is_empty() {
+            break;
+        }
         if manifest_file.content != ManifestContentType::Data {
             continue;
         }
         let manifest = manifest_file.load_manifest(table.file_io()).await?;
         for entry in manifest.entries() {
             if entry.is_alive() {
-                live_paths.insert(entry.file_path().to_string());
+                remaining.remove(entry.file_path());
             }
         }
     }
 
-    let missing: Vec<&str> = referenced_data_file_paths
-        .iter()
-        .filter(|p| !live_paths.contains(p.as_str()))
-        .map(String::as_str)
-        .collect();
+    let missing: Vec<&str> = remaining.into_iter().collect();
 
     if !missing.is_empty() {
         return Err(Error::new(
