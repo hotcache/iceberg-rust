@@ -31,6 +31,7 @@ use crate::error::Result;
 use crate::spec::{DataContentType, DataFile, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
+use crate::transaction::validate::validate_data_files_exist;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
 
@@ -103,6 +104,16 @@ impl RowDeltaAction {
 impl TransactionAction for RowDeltaAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         self.validate()?;
+
+        // Validate that data files referenced by position deletes still exist.
+        let referenced_paths: Vec<String> = self
+            .producer
+            .added_delete_files()
+            .iter()
+            .filter_map(|f| f.referenced_data_file.clone())
+            .collect();
+        validate_data_files_exist(table, &referenced_paths).await?;
+
         self.producer.commit_snapshot(table).await
     }
 }
@@ -212,6 +223,32 @@ mod tests {
                 .unwrap_err()
                 .message()
                 .contains("Cannot add a data file as a delete file")
+        );
+    }
+
+    /// Position delete referencing a non-existent data file should fail.
+    #[tokio::test]
+    async fn test_row_delta_rejects_delete_for_missing_data_file() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let f1 = make_data_file(&table, "test/1.parquet", 100, 1000);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+
+        // Position delete referencing a file that doesn't exist.
+        let del = make_position_delete_file(&table, "test/del-1.parquet", 5, "test/ghost.parquet");
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(del);
+        let tx = action.apply(tx).unwrap();
+        let result = tx.commit(&catalog).await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("reference missing data files"),
+            "expected missing data file error"
         );
     }
 }

@@ -32,6 +32,7 @@ use crate::error::Result;
 use crate::spec::{DataFile, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
+use crate::transaction::validate::validate_no_new_deletes_for_data_files;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
 
@@ -56,7 +57,6 @@ pub struct RewriteFilesAction {
     producer: MergingSnapshotProducer,
     /// The snapshot ID at which this rewrite started reading. Used to
     /// detect conflicting deletes added after this point.
-    #[allow(dead_code)] // Will be used for conflict detection in a follow-up PR.
     starting_snapshot_id: Option<i64>,
 }
 
@@ -106,6 +106,15 @@ impl RewriteFilesAction {
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         self.validate()?;
+
+        // Check that no new delete files target the files we are replacing.
+        validate_no_new_deletes_for_data_files(
+            table,
+            self.starting_snapshot_id,
+            self.producer.deleted_data_files(),
+        )
+        .await?;
+
         self.producer.commit_snapshot(table).await
     }
 }
