@@ -342,6 +342,24 @@ mod tests {
             .unwrap()
     }
 
+    /// Create a test equality delete file in the default partition.
+    pub(crate) fn make_equality_delete_file(
+        table: &Table,
+        path: &str,
+        records: u64,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(records)
+            .partition(Struct::from_iter([Some(Literal::long(1))]))
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .build()
+            .unwrap()
+    }
+
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
