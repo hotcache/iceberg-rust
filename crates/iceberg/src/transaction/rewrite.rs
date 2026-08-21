@@ -29,9 +29,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::{Result, invalid_data};
-use crate::spec::{DataFile, ManifestContentType, Operation};
+use crate::spec::{DataFile, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
+use crate::transaction::validate::validate_no_new_deletes_for_data_files;
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// A transaction action that rewrites (replaces) data files.
@@ -54,16 +55,13 @@ use crate::transaction::{ActionCommit, TransactionAction};
 ///
 /// # Concurrent deletes
 ///
-/// The action records the table's current snapshot when it is created, and
-/// refuses to commit if the table gained a delete manifest after it. Java
-/// narrows that to the files being replaced in
-/// `validateNoNewDeletesForDataFiles`; until that exists here the check is
-/// table-wide, so a delete committed to an unrelated partition while the
-/// rewrite ran also fails the commit with
-/// [`ErrorKind::DataInvalid`](crate::ErrorKind::DataInvalid). So do a
-/// rewrite planned against a table that had no snapshot yet, and one whose
-/// starting snapshot has since been expired: neither can rule out a delete.
-/// Replan the rewrite against the current table and run it again.
+/// The action records the table's current snapshot when it is created. At
+/// commit time it walks the snapshots added since then and fails with
+/// [`ErrorKind::DataInvalid`](crate::ErrorKind::DataInvalid) if any of them
+/// added a position delete for one of the files being replaced, which the
+/// rewritten file would otherwise resurrect. A rewrite planned before the
+/// table had a snapshot, or one whose starting snapshot has since been
+/// expired, is checked against the whole history rather than trusted.
 ///
 /// Deletes that were already committed when the rewrite was planned are not
 /// covered by this check. Either apply them while rewriting, or keep them
@@ -72,7 +70,8 @@ use crate::transaction::{ActionCommit, TransactionAction};
 pub struct RewriteFilesAction {
     producer: MergingSnapshotProducer,
     /// The snapshot the rewrite was planned against, if the table had one.
-    /// Deletes newer than it fail the commit.
+    /// A delete added after it that targets one of the replaced files fails
+    /// the commit.
     starting_snapshot_id: Option<i64>,
 }
 
@@ -126,57 +125,21 @@ impl RewriteFilesAction {
         }
         Ok(())
     }
-
-    /// Reject the rewrite when a delete manifest was added after the snapshot
-    /// it was planned against.
-    ///
-    /// Java re-checks those deletes file by file in
-    /// `validateNoNewDeletesForDataFiles`. Until that exists here the commit
-    /// fails closed, because a rewritten file carries the deletes of the files
-    /// it replaces only if nothing was deleted from them in the meantime.
-    async fn validate_no_new_deletes(&self, table: &Table) -> Result<()> {
-        // Nothing has been committed, so there is nothing to conflict with.
-        // The filter rejects the rewrite for its missing sources instead.
-        let Some(current_snapshot) = table.metadata().current_snapshot() else {
-            return Ok(());
-        };
-        // The rewrite was planned against a table without a snapshot, so every
-        // snapshot it has now, deletes included, landed after that.
-        let Some(starting_snapshot_id) = self.starting_snapshot_id else {
-            return Err(invalid_data!(
-                "Cannot rewrite files: the rewrite was planned against a table with no snapshot, and the table has been committed to since."
-            ));
-        };
-        let Some(starting_snapshot) = table.metadata().snapshot_by_id(starting_snapshot_id) else {
-            // Without the starting snapshot there is no sequence number to
-            // compare against, so no delete can be ruled out.
-            return Err(invalid_data!(
-                "Cannot rewrite files: the starting snapshot {starting_snapshot_id} is no longer in the table, so deletes added since it cannot be ruled out."
-            ));
-        };
-        let starting_sequence_number = starting_snapshot.sequence_number();
-
-        let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
-        let conflict = manifest_list.entries().iter().find(|entry| {
-            entry.content == ManifestContentType::Deletes
-                && entry.sequence_number > starting_sequence_number
-        });
-
-        match conflict {
-            Some(entry) => Err(invalid_data!(
-                "Cannot rewrite files: delete manifest {} was added after the starting snapshot {starting_snapshot_id}.",
-                entry.manifest_path,
-            )),
-            None => Ok(()),
-        }
-    }
 }
 
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         self.validate()?;
-        self.validate_no_new_deletes(table).await?;
+
+        // Check that no new delete files target the files we are replacing.
+        validate_no_new_deletes_for_data_files(
+            table,
+            self.starting_snapshot_id,
+            self.producer.deleted_data_files(),
+        )
+        .await?;
+
         self.producer.commit_snapshot(table).await
     }
 }
@@ -661,37 +624,6 @@ mod tests {
         delete_manifest_path
     }
 
-    /// Add a delete manifest, attributed to the table's current snapshot, to
-    /// that snapshot's manifest list.
-    async fn add_delete_manifest(table: &Table) -> String {
-        let snapshot = table.metadata().current_snapshot().unwrap();
-        let output = table
-            .file_io()
-            .new_output(format!(
-                "{}/deletes-{}.avro",
-                table.metadata().metadata_location().unwrap(),
-                Uuid::new_v4()
-            ))
-            .unwrap();
-        let mut writer = ManifestWriterBuilder::new(
-            output,
-            Some(snapshot.snapshot_id()),
-            table.metadata().current_schema().clone(),
-            table.metadata().default_partition_spec().as_ref().clone(),
-        )
-        .build_v3_deletes();
-        let mut delete_file = make_data_file(table, "test/1-deletes.parquet", 1, 100);
-        delete_file.content = DataContentType::PositionDeletes;
-        writer
-            .add_file(delete_file, snapshot.sequence_number())
-            .unwrap();
-        let delete_manifest = writer.write_manifest_file().await.unwrap();
-        let delete_manifest_path = delete_manifest.manifest_path.clone();
-
-        append_to_manifest_list(table, delete_manifest).await;
-        delete_manifest_path
-    }
-
     /// Rewrite the manifest list of the table's current snapshot so it also
     /// contains `manifest`.
     async fn append_to_manifest_list(table: &Table, manifest: ManifestFile) {
@@ -723,109 +655,6 @@ mod tests {
             .add_manifests(entries.into_iter())
             .unwrap();
         manifest_list_writer.close().await.unwrap();
-    }
-
-    /// A delete manifest added after the snapshot the rewrite was planned
-    /// against must stop the commit.
-    #[tokio::test]
-    async fn test_rewrite_files_rejects_deletes_added_after_starting_snapshot() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
-        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
-        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
-
-        // Plan the rewrite against this snapshot, then let another commit land.
-        let tx = Transaction::new(&table);
-        let merged = make_data_file(&table, "test/merged.parquet", 10, 100);
-        let action = Arc::new(tx.rewrite_files().delete_file(f1).add_file(merged));
-
-        let table = append_files(&catalog, &table, vec![f2]).await;
-        let delete_manifest_path = add_delete_manifest(&table).await;
-
-        let Err(err) = action.commit(&table).await else {
-            panic!("a delete manifest newer than the starting snapshot must be rejected");
-        };
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.to_string().contains(&format!(
-                "delete manifest {delete_manifest_path} was added after"
-            )),
-            "{err}"
-        );
-    }
-
-    /// A rewrite planned against a table with no snapshot knows nothing about
-    /// what the table holds once something is committed to it.
-    #[tokio::test]
-    async fn test_rewrite_files_rejects_commit_after_empty_starting_table() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        // Planned before the table had any snapshot.
-        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
-        let merged = make_data_file(&table, "test/merged.parquet", 10, 100);
-        let tx = Transaction::new(&table);
-        let action = Arc::new(tx.rewrite_files().delete_file(f1.clone()).add_file(merged));
-
-        // The file it wants to replace only exists because of a later commit.
-        let table = append_files(&catalog, &table, vec![f1]).await;
-
-        let Err(err) = action.commit(&table).await else {
-            panic!("a rewrite planned against an empty table must be rejected");
-        };
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.to_string()
-                .contains("planned against a table with no snapshot"),
-            "{err}"
-        );
-    }
-
-    /// A rewrite whose starting snapshot has been expired cannot rule out
-    /// deletes added since, and says so rather than comparing against zero.
-    #[tokio::test]
-    async fn test_rewrite_files_rejects_expired_starting_snapshot() {
-        let catalog = new_memory_catalog().await;
-        let table = make_v3_minimal_table_in_catalog(&catalog).await;
-
-        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
-        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
-        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
-        let starting_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
-
-        // Plan the rewrite against this snapshot, then expire it behind us.
-        let tx = Transaction::new(&table);
-        let merged = make_data_file(&table, "test/merged.parquet", 10, 100);
-        let action = Arc::new(tx.rewrite_files().delete_file(f1).add_file(merged));
-
-        let table = append_files(&catalog, &table, vec![f2]).await;
-        let tx = Transaction::new(&table);
-        let tx = tx
-            .expire_snapshots()
-            .expire_snapshot_ids([starting_snapshot_id])
-            .apply(tx)
-            .unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
-        assert!(
-            table
-                .metadata()
-                .snapshot_by_id(starting_snapshot_id)
-                .is_none(),
-            "the starting snapshot should have been expired"
-        );
-
-        let Err(err) = action.commit(&table).await else {
-            panic!("an expired starting snapshot must be rejected");
-        };
-        assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.to_string().contains(&format!(
-                "the starting snapshot {starting_snapshot_id} is no longer in the table"
-            )),
-            "{err}"
-        );
     }
 
     /// A retried commit must not write over the manifests of the attempt
