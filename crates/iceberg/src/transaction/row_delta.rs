@@ -110,32 +110,11 @@ impl TransactionAction for RowDeltaAction {
 #[cfg(test)]
 mod tests {
     use crate::memory::tests::new_memory_catalog;
-    use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, Operation, Struct,
-    };
+    use crate::spec::Operation;
     use crate::transaction::tests::{
-        append_files, make_data_file, make_v3_minimal_table_in_catalog,
+        append_files, make_data_file, make_position_delete_file, make_v3_minimal_table_in_catalog,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
-
-    fn make_position_delete_file(
-        table: &crate::table::Table,
-        path: &str,
-        records: u64,
-        referenced_data_file: &str,
-    ) -> crate::spec::DataFile {
-        DataFileBuilder::default()
-            .content(DataContentType::PositionDeletes)
-            .file_path(path.to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(50)
-            .record_count(records)
-            .partition(Struct::from_iter([Some(Literal::long(1))]))
-            .partition_spec_id(table.metadata().default_partition_spec_id())
-            .referenced_data_file(Some(referenced_data_file.to_string()))
-            .build()
-            .unwrap()
-    }
 
     /// Add data files and position delete files in a single RowDelta.
     #[tokio::test]

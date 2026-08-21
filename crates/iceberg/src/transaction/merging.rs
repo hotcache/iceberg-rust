@@ -198,8 +198,6 @@ impl ManifestFilterManager {
             let output_file = table.file_io().new_output(new_manifest_path)?;
             // Use the current snapshot_id so that the manifest list writer
             // can assign sequence numbers to this rewritten manifest.
-            // Use the current snapshot_id so that the manifest list writer
-            // can assign sequence numbers to this rewritten manifest.
             let mut writer = new_manifest_writer(
                 table,
                 output_file,
