@@ -348,4 +348,82 @@ mod tests {
                 .contains("at least one file to add")
         );
     }
+
+    /// Verify that the manifest cache is reused across multiple
+    /// `commit_snapshot` calls (simulating a retry scenario).
+    /// The added-file manifest should be written once and reused on the
+    /// second call, confirmed by the same manifest path appearing in both
+    /// snapshots.
+    #[tokio::test]
+    async fn test_manifest_cache_reused_on_retry() {
+        use std::sync::Arc;
+
+        use crate::TableUpdate;
+        use crate::spec::SnapshotRef;
+        use crate::transaction::TransactionAction;
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        // Append files first.
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let f2 = make_data_file(&table, "test/2.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1.clone(), f2.clone()]).await;
+
+        // Build a RewriteFilesAction (without committing via Transaction,
+        // so we can call commit() twice to simulate retry).
+        let merged = make_data_file(&table, "test/merged.parquet", 20, 200);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_file(f1)
+            .delete_file(f2)
+            .add_file(merged);
+        let action = Arc::new(action);
+
+        // Helper: extract the snapshot from an ActionCommit.
+        let extract_snapshot = |updates: &[TableUpdate]| -> crate::spec::Snapshot {
+            updates
+                .iter()
+                .find_map(|u| match u {
+                    TableUpdate::AddSnapshot { snapshot } => Some(snapshot.clone()),
+                    _ => None,
+                })
+                .expect("commit should produce AddSnapshot")
+        };
+
+        // First call — writes manifest and caches it.
+        let mut result1 = Arc::clone(&action).commit(&table).await.unwrap();
+        let updates1 = result1.take_updates();
+        let snap1 = extract_snapshot(&updates1);
+
+        // Second call — should reuse cached manifest.
+        let mut result2 = Arc::clone(&action).commit(&table).await.unwrap();
+        let updates2 = result2.take_updates();
+        let snap2 = extract_snapshot(&updates2);
+
+        // Both snapshots should use the same snapshot_id (cached).
+        assert_eq!(snap1.snapshot_id(), snap2.snapshot_id());
+
+        // Load manifests from both snapshots and verify the added-file
+        // manifest path is identical (proving cache reuse, not rewrite).
+        let load_added_manifest_path = |snap: crate::spec::Snapshot| async {
+            let snap_ref: SnapshotRef = Arc::new(snap);
+            let manifest_list = table.manifest_list_reader(&snap_ref).load().await.unwrap();
+            manifest_list
+                .entries()
+                .iter()
+                .find(|m| m.manifest_path.contains("-m-added"))
+                .expect("should have an added-file manifest")
+                .manifest_path
+                .clone()
+        };
+
+        let path1 = load_added_manifest_path(snap1).await;
+        let path2 = load_added_manifest_path(snap2).await;
+        assert_eq!(
+            path1, path2,
+            "added-file manifest should be reused from cache, not rewritten"
+        );
+    }
 }
