@@ -96,20 +96,22 @@ impl ManifestFilterManager {
     }
 
     /// Filter `manifests` by removing entries whose file path is in the delete
-    /// set. Returns the surviving manifests plus a [`SnapshotSummaryCollector`]
-    /// that recorded metrics for every removed file.
+    /// set. Returns the surviving manifests, a [`SnapshotSummaryCollector`]
+    /// that recorded metrics for every removed file, and the paths of any
+    /// newly written manifest files (for orphan cleanup on retry).
     pub(crate) async fn filter_manifests(
         &self,
         table: &Table,
         manifests: Vec<ManifestFile>,
         snapshot_id: i64,
-    ) -> Result<(Vec<ManifestFile>, SnapshotSummaryCollector)> {
+    ) -> Result<(Vec<ManifestFile>, SnapshotSummaryCollector, Vec<String>)> {
         if self.deleted_file_paths.is_empty() {
-            return Ok((manifests, SnapshotSummaryCollector::default()));
+            return Ok((manifests, SnapshotSummaryCollector::default(), Vec::new()));
         }
 
         let mut result: Vec<ManifestFile> = Vec::with_capacity(manifests.len());
         let mut removed_collector = SnapshotSummaryCollector::default();
+        let mut written_manifest_paths: Vec<String> = Vec::new();
         let mut found_paths: HashSet<String> = HashSet::new();
 
         for manifest_file in &manifests {
@@ -208,6 +210,7 @@ impl ManifestFilterManager {
                 writer.add_entry(entry)?;
             }
             let new_manifest = writer.write_manifest_file().await?;
+            written_manifest_paths.push(new_manifest.manifest_path.clone());
             result.push(new_manifest);
         }
 
@@ -230,7 +233,7 @@ impl ManifestFilterManager {
             }
         }
 
-        Ok((result, removed_collector))
+        Ok((result, removed_collector, written_manifest_paths))
     }
 }
 
@@ -280,6 +283,10 @@ struct ManifestCache {
     /// Manifests written for newly added data files. These are
     /// content-stable across retries and can be reused as-is.
     new_data_manifests: Option<Vec<ManifestFile>>,
+    /// Paths of filtered manifest files written during the previous
+    /// attempt. On retry, these are deleted before writing new ones
+    /// to avoid orphaned files in storage.
+    previous_filter_manifest_paths: Vec<String>,
 }
 
 impl MergingSnapshotProducer {
@@ -356,12 +363,26 @@ impl MergingSnapshotProducer {
             None => Vec::new(),
         };
 
-        // 2. Filter existing manifests — always redo on each attempt
-        //    because the base snapshot may have changed after a retry.
-        let (mut filtered_manifests, removed_collector) = self
+        // 2. Clean up filtered manifests from any previous attempt, then
+        //    redo filtering (the base snapshot may have changed after a retry).
+        let orphaned_paths: Vec<String> = {
+            let mut cache = self.cache.lock().expect("cache lock poisoned");
+            cache.previous_filter_manifest_paths.drain(..).collect()
+        };
+        for path in &orphaned_paths {
+            if let Err(e) = table.file_io().delete(path).await {
+                tracing::warn!("Failed to clean up orphaned filtered manifest {}: {}", path, e);
+            }
+        }
+        let (mut filtered_manifests, removed_collector, filter_written_paths) = self
             .filter_manager
             .filter_manifests(table, existing_manifests, snapshot_id)
             .await?;
+        // Track written paths so we can clean them up on the next retry.
+        {
+            let mut cache = self.cache.lock().expect("cache lock poisoned");
+            cache.previous_filter_manifest_paths = filter_written_paths;
+        }
 
         // 3. Get cached or write new manifests for added files.
         //    Added files don't change between retries, so their manifests
