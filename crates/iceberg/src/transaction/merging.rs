@@ -286,6 +286,11 @@ pub(crate) struct MergingSnapshotProducer {
     ///
     /// The snapshot_id is also cached so that the manifest list writer
     /// can correctly assign sequence numbers to cached manifests.
+    ///
+    /// This uses `Mutex` for interior mutability because
+    /// `TransactionAction::commit` receives `self: Arc<Self>`, requiring
+    /// shared-reference mutation. The lock is held only for brief
+    /// cache reads/writes — never across `.await` points.
     cache: Mutex<ManifestCache>,
 }
 
@@ -369,14 +374,12 @@ impl MergingSnapshotProducer {
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_duplicate_files().await?;
 
-        // Reuse a stable snapshot_id across retries. Cached manifests carry
-        // this id, and the manifest list writer requires it to match when
-        // assigning sequence numbers. On the first attempt we take the id
-        // that SnapshotProducer generated; on retries we override it with
-        // the cached one.
-        let snapshot_id = {
+        // Snapshot the cache state in a single lock acquisition. This
+        // avoids multiple lock/unlock cycles and keeps the critical section
+        // brief (no `.await` while locked).
+        let (snapshot_id, cached_manifests) = {
             let mut cache = self.cache.lock().expect("cache lock poisoned");
-            match cache.snapshot_id {
+            let snapshot_id = match cache.snapshot_id {
                 Some(id) => {
                     snapshot_producer.snapshot_id = id;
                     id
@@ -386,7 +389,8 @@ impl MergingSnapshotProducer {
                     cache.snapshot_id = Some(id);
                     id
                 }
-            }
+            };
+            (snapshot_id, cache.new_data_manifests.clone())
         };
 
         // 1. Load existing manifests from the current snapshot.
@@ -421,19 +425,17 @@ impl MergingSnapshotProducer {
         //    Added files don't change between retries, so their manifests
         //    can be safely reused.
         if !self.added_data_files.is_empty() {
-            let cached = {
-                let cache = self.cache.lock().expect("cache lock poisoned");
-                cache.new_data_manifests.clone()
-            };
-            let added_manifests = match cached {
+            let added_manifests = match cached_manifests {
                 Some(manifests) => manifests,
                 None => {
                     let manifest = self
                         .write_added_manifest(table, snapshot_id, &self.manifest_counter)
                         .await?;
                     let manifests = vec![manifest];
-                    let mut cache = self.cache.lock().expect("cache lock poisoned");
-                    cache.new_data_manifests = Some(manifests.clone());
+                    self.cache
+                        .lock()
+                        .expect("cache lock poisoned")
+                        .new_data_manifests = Some(manifests.clone());
                     manifests
                 }
             };
