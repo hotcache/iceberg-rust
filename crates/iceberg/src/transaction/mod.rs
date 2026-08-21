@@ -321,6 +321,26 @@ mod tests {
         tx.commit(catalog).await.unwrap()
     }
 
+    /// Create a test position delete file referencing a specific data file.
+    pub(crate) fn make_position_delete_file(
+        table: &Table,
+        path: &str,
+        records: u64,
+        referenced_data_file: &str,
+    ) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(records)
+            .partition(Struct::from_iter([Some(Literal::long(1))]))
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .referenced_data_file(Some(referenced_data_file.to_string()))
+            .build()
+            .unwrap()
+    }
+
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
             "{}/testdata/table_metadata/{}",
