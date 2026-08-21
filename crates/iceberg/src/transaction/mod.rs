@@ -56,7 +56,9 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod merging;
+mod overwrite;
 mod rewrite;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -77,7 +79,9 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+use crate::transaction::overwrite::OverwriteFilesAction;
 use crate::transaction::rewrite::RewriteFilesAction;
+use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -161,6 +165,24 @@ impl Transaction {
     /// [`Operation::Replace`](crate::spec::Operation::Replace).
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new(self.table.metadata().current_snapshot_id())
+    }
+
+    /// Creates an overwrite files action.
+    ///
+    /// This action replaces data files with new ones, changing the logical
+    /// contents of the table. The resulting snapshot operation depends on
+    /// which files are provided: delete-only, add-only, or both.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
+    }
+
+    /// Creates a row delta action.
+    ///
+    /// This action adds data files and/or delete files (position or equality
+    /// deletes) to the table in a single atomic operation. This is the
+    /// primary mechanism for row-level updates and deletes.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Creates replace sort order action.
