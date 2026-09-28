@@ -308,7 +308,9 @@ struct ManifestCache {
     new_data_manifests: Option<Vec<ManifestFile>>,
     /// Paths of filtered manifest files written during the previous
     /// attempt. On retry, these are deleted before writing new ones
-    /// to avoid orphaned files in storage.
+    /// to avoid orphaned files in storage. The paths of the last attempt
+    /// are left behind when the retry loop gives up, so a commit that
+    /// exhausts its retries still leaks them.
     previous_filter_manifest_paths: Vec<String>,
 }
 
@@ -417,6 +419,14 @@ impl MergingSnapshotProducer {
 
         // 2. Clean up filtered manifests from any previous attempt, then
         //    redo filtering (the base snapshot may have changed after a retry).
+        //
+        //    Deleting them is safe because a commit is only retried on a
+        //    definitive rejection -- `CatalogCommitConflicts`, the one kind of
+        //    error the catalogs mark retryable -- so the previous attempt
+        //    provably did not commit and no snapshot references these
+        //    manifests. An outcome the catalog could not confirm is not
+        //    retryable and never reaches a second attempt. Widening what
+        //    counts as retryable would invalidate that.
         let orphaned_paths: Vec<String> = {
             let mut cache = self.cache.lock().expect("cache lock poisoned");
             cache.previous_filter_manifest_paths.drain(..).collect()
