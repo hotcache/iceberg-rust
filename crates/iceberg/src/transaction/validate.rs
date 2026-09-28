@@ -118,8 +118,13 @@ pub(crate) async fn validate_no_new_deletes_for_data_files(
     // to detect conflicting equality deletes (which don't carry a
     // `referenced_data_file` and instead target all data files in the
     // same partition).
-    let replaced_partitions: HashSet<&Struct> =
-        replaced_data_files.iter().map(|f| f.partition()).collect();
+    // Keyed by spec as well as value: an equality delete only applies to data
+    // files recorded under the same partition spec, so two specs that happen to
+    // produce the same tuple are not the same partition.
+    let replaced_partitions: HashSet<(i32, &Struct)> = replaced_data_files
+        .iter()
+        .map(|f| (f.partition_spec_id, f.partition()))
+        .collect();
 
     // For each snapshot that may have added deletes, load its delete manifests
     // and check for conflicts.
@@ -159,15 +164,23 @@ pub(crate) async fn validate_no_new_deletes_for_data_files(
                         ));
                     }
                 } else if delete_file.content_type() == DataContentType::EqualityDeletes {
-                    // Equality deletes without a referenced_data_file target
-                    // all data files in the same partition. If any replaced
-                    // file shares the partition, this is a conflict.
-                    if replaced_partitions.contains(delete_file.partition()) {
+                    // Equality deletes carry no referenced_data_file. One
+                    // written under a partitioned spec applies to the data
+                    // files of its own spec and partition; one written under an
+                    // unpartitioned spec is a global delete and applies to every
+                    // data file. A spec the table no longer knows cannot be
+                    // placed at all, so treat it as applying.
+                    let spec_id = delete_file.partition_spec_id;
+                    let global = match metadata.partition_spec_by_id(spec_id) {
+                        Some(spec) => spec.is_unpartitioned(),
+                        None => true,
+                    };
+                    if global || replaced_partitions.contains(&(spec_id, delete_file.partition())) {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             format!(
-                                "Cannot commit, found new equality delete in partition {:?} \
-                                 that conflicts with replaced data file(s)",
+                                "Cannot commit, found new equality delete in spec {spec_id} \
+                                 partition {:?} that conflicts with replaced data file(s)",
                                 delete_file.partition(),
                             ),
                         ));
@@ -372,6 +385,43 @@ mod tests {
             .partition_spec_id(table.metadata().default_partition_spec_id())
             .build()
             .unwrap()
+    }
+
+    /// An equality delete whose partition tuple matches but whose spec does
+    /// not is never applied to the replaced file, so it is not a conflict.
+    #[tokio::test]
+    async fn test_validate_passes_with_equality_delete_of_other_spec() {
+        use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let f1 = make_data_file(&table, "test/1.parquet", 100, 1000);
+        let table = append_files(&catalog, &table, vec![f1.clone()]).await;
+        let starting = table.metadata().current_snapshot_id();
+
+        let eq_del = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("test/eq-del-other-spec.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(3)
+            .partition(Struct::from_iter([Some(Literal::long(1))]))
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .build()
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(eq_del);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // The replaced file is recorded under a different spec than the delete.
+        let mut replaced = f1;
+        replaced.partition_spec_id = table.metadata().default_partition_spec_id() + 1;
+
+        validate_no_new_deletes_for_data_files(&table, starting, &[replaced])
+            .await
+            .expect("a delete of another spec never reaches this file");
     }
 
     /// Concurrent equality delete in the same partition as a replaced file →
