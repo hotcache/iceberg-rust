@@ -363,13 +363,28 @@ impl MergingSnapshotProducer {
         Ok(())
     }
 
-    /// Produce manifests, compute summary, and commit a new snapshot.
+    /// Produce manifests, compute summary, and commit a new snapshot
+    /// using the operation type specified at construction time.
+    pub(crate) async fn commit_snapshot(&self, table: &Table) -> Result<ActionCommit> {
+        self.commit_snapshot_with_operation(table, self.operation.clone())
+            .await
+    }
+
+    /// Produce manifests, compute summary, and commit a new snapshot
+    /// with the given operation type.
     ///
     /// On the first call, this writes new manifests for added files and
     /// caches them. On subsequent calls (retries), the cached manifests
     /// are reused while existing-manifest filtering is always redone
     /// (because the base snapshot may have changed).
-    pub(crate) async fn commit_snapshot(&self, table: &Table) -> Result<ActionCommit> {
+    ///
+    /// The `operation` parameter allows callers like `OverwriteFilesAction`
+    /// to determine the operation type dynamically.
+    pub(crate) async fn commit_snapshot_with_operation(
+        &self,
+        table: &Table,
+        operation: Operation,
+    ) -> Result<ActionCommit> {
         self.validate_data_sequence_number(table)?;
         // Create the SnapshotProducer first so we can use its snapshot_id
         // for new manifests. This ensures the manifest list writer can
@@ -478,7 +493,7 @@ impl MergingSnapshotProducer {
         }
 
         // 4. Compute summary (added + removed).
-        let summary = self.build_summary(table, removed_collector)?;
+        let summary = self.build_summary(table, removed_collector, &operation)?;
 
         // 5. Delegate to SnapshotProducer for manifest list + snapshot creation.
         snapshot_producer
@@ -537,6 +552,7 @@ impl MergingSnapshotProducer {
         &self,
         table: &Table,
         removed_collector: SnapshotSummaryCollector,
+        operation: &Operation,
     ) -> Result<Summary> {
         let table_metadata = table.metadata_ref();
         let schema = table_metadata.current_schema().clone();
@@ -557,7 +573,7 @@ impl MergingSnapshotProducer {
         }
 
         let summary = Summary {
-            operation: self.operation.clone(),
+            operation: operation.clone(),
             additional_properties: collector.build(),
         };
 

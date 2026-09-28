@@ -56,6 +56,7 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod merging;
+mod overwrite;
 mod rewrite;
 mod snapshot;
 mod sort_order;
@@ -77,6 +78,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::overwrite::OverwriteFilesAction;
 pub use crate::transaction::rewrite::RewriteFilesAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
@@ -161,6 +163,15 @@ impl Transaction {
     /// [`Operation::Replace`](crate::spec::Operation::Replace).
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new(self.table.metadata().current_snapshot_id())
+    }
+
+    /// Creates an overwrite files action.
+    ///
+    /// This action replaces data files with new ones, changing the logical
+    /// contents of the table. The resulting snapshot operation depends on
+    /// which files are provided: delete-only, add-only, or both.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
     }
 
     /// Creates replace sort order action.
