@@ -28,7 +28,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::spec::{DataContentType, DataFile, Operation};
+use crate::spec::{DataContentType, DataFile, FormatVersion, Operation};
 use crate::table::Table;
 use crate::transaction::merging::MergingSnapshotProducer;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -96,12 +96,28 @@ impl RowDeltaAction {
 
         Ok(())
     }
+
+    /// Delete files need a V2 or later manifest to live in. Check before
+    /// anything is written, so a V1 table does not end up with the data
+    /// manifest of a commit that cannot finish.
+    fn validate_format_version(&self, table: &Table) -> Result<()> {
+        if self.producer.has_added_delete_files()
+            && table.metadata().format_version() == FormatVersion::V1
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Delete files are not supported in format version 1",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl TransactionAction for RowDeltaAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         self.validate()?;
+        self.validate_format_version(table)?;
         self.producer.commit_snapshot(table).await
     }
 }
@@ -111,7 +127,8 @@ mod tests {
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::Operation;
     use crate::transaction::tests::{
-        append_files, make_data_file, make_position_delete_file, make_v3_minimal_table_in_catalog,
+        append_files, make_data_file, make_position_delete_file, make_v1_minimal_table_in_catalog,
+        make_v3_minimal_table_in_catalog,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
@@ -193,6 +210,32 @@ mod tests {
     }
 
     /// Adding a data file as a delete should fail.
+    /// A V1 table has nowhere to put a delete file, and the commit must say
+    /// so before it writes anything.
+    #[tokio::test]
+    async fn test_row_delta_rejects_delete_files_on_v1_table() {
+        use crate::ErrorKind;
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v1_minimal_table_in_catalog(&catalog).await;
+
+        let f1 = make_data_file(&table, "test/1.parquet", 10, 100);
+        let table = append_files(&catalog, &table, vec![f1]).await;
+
+        let del = make_position_delete_file(&table, "test/del-1.parquet", 5, "test/1.parquet");
+        let tx = Transaction::new(&table);
+        let action = tx.row_delta().add_deletes(del);
+        let tx = action.apply(tx).unwrap();
+        let err = tx.commit(&catalog).await.unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        assert!(
+            err.to_string()
+                .contains("Delete files are not supported in format version 1"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_row_delta_rejects_data_file_as_delete() {
         let catalog = new_memory_catalog().await;
