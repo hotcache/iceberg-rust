@@ -37,7 +37,7 @@ use crate::{Error, ErrorKind};
 /// A transaction action that applies row-level changes to a table.
 ///
 /// This is the Rust equivalent of Java's `BaseRowDelta`. It uses
-/// [`MergingSnapshotProducer`] to handle manifest creation for both
+/// `MergingSnapshotProducer` to handle manifest creation for both
 /// data files and delete files.
 ///
 /// # Example
