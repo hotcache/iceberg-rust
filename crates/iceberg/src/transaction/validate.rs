@@ -25,7 +25,9 @@
 use std::collections::HashSet;
 
 use crate::error::Result;
-use crate::spec::{DataContentType, DataFile, ManifestContentType, Operation, Struct, TableMetadata};
+use crate::spec::{
+    DataContentType, DataFile, ManifestContentType, Operation, Struct, TableMetadata,
+};
 use crate::table::Table;
 use crate::{Error, ErrorKind};
 
@@ -116,10 +118,8 @@ pub(crate) async fn validate_no_new_deletes_for_data_files(
     // to detect conflicting equality deletes (which don't carry a
     // `referenced_data_file` and instead target all data files in the
     // same partition).
-    let replaced_partitions: HashSet<&Struct> = replaced_data_files
-        .iter()
-        .map(|f| f.partition())
-        .collect();
+    let replaced_partitions: HashSet<&Struct> =
+        replaced_data_files.iter().map(|f| f.partition()).collect();
 
     // For each snapshot that may have added deletes, load its delete manifests
     // and check for conflicts.
@@ -406,9 +406,7 @@ mod tests {
     /// Concurrent equality delete in a DIFFERENT partition → validation passes.
     #[tokio::test]
     async fn test_validate_passes_with_equality_delete_different_partition() {
-        use crate::spec::{
-            DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct,
-        };
+        use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
 
         let catalog = new_memory_catalog().await;
         let table = make_v3_minimal_table_in_catalog(&catalog).await;
