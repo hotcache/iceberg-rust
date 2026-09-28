@@ -501,6 +501,140 @@ impl MergingSnapshotProducer {
             .await
     }
 
+    /// Commit a snapshot where delete files are determined dynamically
+    /// (e.g., by a row filter) on each attempt.
+    ///
+    /// Unlike `commit_snapshot_with_operation`, this method accepts
+    /// delete files as a parameter rather than using the internal
+    /// `filter_manager`. This allows the caller to re-evaluate which
+    /// files to delete on each retry while still reusing the cached
+    /// added-file manifests.
+    pub(crate) async fn commit_snapshot_with_dynamic_deletes(
+        &self,
+        table: &Table,
+        operation: Operation,
+        delete_files: Vec<DataFile>,
+    ) -> Result<ActionCommit> {
+        self.validate_data_sequence_number(table)?;
+        let mut snapshot_producer = SnapshotProducer::new(
+            table,
+            self.commit_uuid,
+            HashMap::new(),
+            self.added_data_files.clone(),
+        );
+        snapshot_producer.validate_added_data_files()?;
+        snapshot_producer.validate_duplicate_files().await?;
+
+        let (snapshot_id, cached_manifests) = {
+            let mut cache = self.cache.lock().expect("cache lock poisoned");
+            let snapshot_id = match cache.snapshot_id {
+                Some(id) => {
+                    snapshot_producer.snapshot_id = id;
+                    id
+                }
+                None => {
+                    let id = snapshot_producer.snapshot_id;
+                    cache.snapshot_id = Some(id);
+                    id
+                }
+            };
+            (snapshot_id, cache.new_data_manifests.clone())
+        };
+
+        // 1. Load existing manifests.
+        let existing_manifests = match table.metadata().current_snapshot() {
+            Some(snapshot) => {
+                let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+                manifest_list
+                    .entries()
+                    .iter()
+                    // Java's third arm is the new snapshot's id, which no existing manifest has.
+                    .filter(|e| e.has_added_files() || e.has_existing_files())
+                    .cloned()
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+
+        // 2. Clean up filtered manifests from any previous attempt, then
+        //    build a temporary filter manager for the dynamic deletes.
+        let orphaned_paths: Vec<String> = {
+            let mut cache = self.cache.lock().expect("cache lock poisoned");
+            cache.previous_filter_manifest_paths.drain(..).collect()
+        };
+        for path in &orphaned_paths {
+            if let Err(e) = table.file_io().delete(path).await {
+                tracing::warn!(
+                    "Failed to clean up orphaned filtered manifest {}: {}",
+                    path,
+                    e
+                );
+            }
+        }
+        let mut filter = ManifestFilterManager::new(true);
+        for f in &delete_files {
+            filter.add_delete(f.file_path.clone());
+        }
+        let (mut filtered_manifests, removed_collector, filter_written_paths) = filter
+            .filter_manifests(
+                table,
+                existing_manifests,
+                snapshot_id,
+                self.commit_uuid,
+                &self.manifest_counter,
+            )
+            .await?;
+        // Track written paths so we can clean them up on the next retry.
+        {
+            let mut cache = self.cache.lock().expect("cache lock poisoned");
+            cache.previous_filter_manifest_paths = filter_written_paths;
+        }
+
+        // 3. Reuse cached added-file manifests.
+        if !self.added_data_files.is_empty() {
+            let added_manifests = match cached_manifests {
+                Some(manifests) => manifests,
+                None => {
+                    let manifest = self
+                        .write_added_manifest(table, snapshot_id, &self.manifest_counter)
+                        .await?;
+                    let manifests = vec![manifest];
+                    self.cache
+                        .lock()
+                        .expect("cache lock poisoned")
+                        .new_data_manifests = Some(manifests.clone());
+                    manifests
+                }
+            };
+            filtered_manifests.extend(added_manifests);
+        }
+
+        // 4. Compute summary including dynamic deletes.
+        let table_metadata = table.metadata_ref();
+        let schema = table_metadata.current_schema().clone();
+        let partition_spec = table_metadata.default_partition_spec().clone();
+
+        let mut collector = SnapshotSummaryCollector::default();
+        for file in &self.added_data_files {
+            collector.add_file(file, schema.clone(), partition_spec.clone());
+        }
+        collector.merge(removed_collector);
+
+        let summary = Summary {
+            operation: operation.clone(),
+            additional_properties: collector.build(),
+        };
+
+        let previous_snapshot = table_metadata.current_snapshot();
+        let summary =
+            update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)?;
+
+        // 5. Commit.
+        snapshot_producer
+            .commit_with_manifests(filtered_manifests, summary)
+            .await
+    }
+
     async fn write_added_manifest(
         &self,
         table: &Table,

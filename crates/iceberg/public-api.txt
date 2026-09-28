@@ -3255,6 +3255,7 @@ pub struct iceberg::transaction::OverwriteFilesAction
 impl iceberg::transaction::OverwriteFilesAction
 pub fn iceberg::transaction::OverwriteFilesAction::add_file(self, file: iceberg::spec::DataFile) -> Self
 pub fn iceberg::transaction::OverwriteFilesAction::delete_file(self, file: iceberg::spec::DataFile) -> Self
+pub fn iceberg::transaction::OverwriteFilesAction::overwrite_by_row_filter(self, filter: iceberg::expr::Predicate) -> Self
 pub struct iceberg::transaction::ReplaceSortOrderAction
 impl iceberg::transaction::ReplaceSortOrderAction
 pub fn iceberg::transaction::ReplaceSortOrderAction::asc(self, name: &str, null_order: iceberg::spec::NullOrder) -> Self
