@@ -38,6 +38,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::snapshot::SnapshotProducer;
+use crate::{Error, ErrorKind};
 
 /// Create a manifest writer that handles encryption when available.
 fn new_manifest_writer(
@@ -272,6 +273,9 @@ pub(crate) struct MergingSnapshotProducer {
     operation: Operation,
     added_data_files: Vec<DataFile>,
     deleted_data_files: Vec<DataFile>,
+    /// Delete files (position/equality) to add to the snapshot.
+    /// These are written to a separate delete manifest.
+    added_delete_files: Vec<DataFile>,
     filter_manager: ManifestFilterManager,
     commit_uuid: Uuid,
     data_sequence_number: Option<i64>,
@@ -306,6 +310,8 @@ struct ManifestCache {
     /// Manifests written for newly added data files. These are
     /// content-stable across retries and can be reused as-is.
     new_data_manifests: Option<Vec<ManifestFile>>,
+    /// Manifests written for newly added delete files.
+    new_delete_manifests: Option<Vec<ManifestFile>>,
     /// Paths of filtered manifest files written during the previous
     /// attempt. On retry, these are deleted before writing new ones
     /// to avoid orphaned files in storage. The paths of the last attempt
@@ -320,6 +326,7 @@ impl MergingSnapshotProducer {
             operation,
             added_data_files: Vec::new(),
             deleted_data_files: Vec::new(),
+            added_delete_files: Vec::new(),
             filter_manager: ManifestFilterManager::new(true),
             commit_uuid: Uuid::now_v7(),
             data_sequence_number: None,
@@ -336,6 +343,11 @@ impl MergingSnapshotProducer {
         self.data_sequence_number = Some(sequence_number);
     }
 
+    /// Add a delete file (position or equality) to the snapshot.
+    pub(crate) fn add_delete_file(&mut self, file: DataFile) {
+        self.added_delete_files.push(file);
+    }
+
     pub(crate) fn delete_data_file(&mut self, file: DataFile) {
         self.filter_manager.add_delete(file.file_path.clone());
         self.deleted_data_files.push(file);
@@ -347,6 +359,14 @@ impl MergingSnapshotProducer {
 
     pub(crate) fn has_deleted_data_files(&self) -> bool {
         !self.deleted_data_files.is_empty()
+    }
+
+    pub(crate) fn has_added_delete_files(&self) -> bool {
+        !self.added_delete_files.is_empty()
+    }
+
+    pub(crate) fn added_delete_files(&self) -> &[DataFile] {
+        &self.added_delete_files
     }
 
     /// Reject a data sequence number above the one the new snapshot will carry.
@@ -481,7 +501,13 @@ impl MergingSnapshotProducer {
                 Some(manifests) => manifests,
                 None => {
                     let manifest = self
-                        .write_added_manifest(table, snapshot_id, &self.manifest_counter)
+                        .write_manifest_for_files(
+                            table,
+                            snapshot_id,
+                            &self.manifest_counter,
+                            ManifestContentType::Data,
+                            &self.added_data_files,
+                        )
                         .await?;
                     let manifests = vec![manifest];
                     self.cache
@@ -492,6 +518,33 @@ impl MergingSnapshotProducer {
                 }
             };
             filtered_manifests.extend(added_manifests);
+        }
+
+        // 3b. Get cached or write new manifests for added delete files.
+        if !self.added_delete_files.is_empty() {
+            let cached = {
+                let cache = self.cache.lock().expect("cache lock poisoned");
+                cache.new_delete_manifests.clone()
+            };
+            let delete_manifests = match cached {
+                Some(manifests) => manifests,
+                None => {
+                    let manifest = self
+                        .write_manifest_for_files(
+                            table,
+                            snapshot_id,
+                            &self.manifest_counter,
+                            ManifestContentType::Deletes,
+                            &self.added_delete_files,
+                        )
+                        .await?;
+                    let manifests = vec![manifest];
+                    let mut cache = self.cache.lock().expect("cache lock poisoned");
+                    cache.new_delete_manifests = Some(manifests.clone());
+                    manifests
+                }
+            };
+            filtered_manifests.extend(delete_manifests);
         }
 
         // 4. Compute summary (added + removed).
@@ -537,12 +590,24 @@ impl MergingSnapshotProducer {
             .await
     }
 
-    async fn write_added_manifest(
+    /// Write a manifest file for the given files and content type.
+    async fn write_manifest_for_files(
         &self,
         table: &Table,
         snapshot_id: i64,
         manifest_counter: &AtomicU64,
+        content: ManifestContentType,
+        files: &[DataFile],
     ) -> Result<ManifestFile> {
+        if content == ManifestContentType::Deletes
+            && table.metadata().format_version() == FormatVersion::V1
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Delete files are not supported in format version 1",
+            ));
+        }
+
         let new_manifest_path = format!(
             "{}/{}-m{}.{}",
             table.metadata().metadata_location()?,
@@ -558,20 +623,20 @@ impl MergingSnapshotProducer {
             table,
             output_file,
             Some(snapshot_id),
-            ManifestContentType::Data,
+            content,
             schema,
             partition_spec,
         )?;
 
         let format_version = table.metadata().format_version();
-        for data_file in &self.added_data_files {
+        for file in files {
             if let Some(sequence_number) = self.data_sequence_number {
-                writer.add_file(data_file.clone(), sequence_number)?;
+                writer.add_file(file.clone(), sequence_number)?;
                 continue;
             }
             let entry_builder = ManifestEntry::builder()
                 .status(ManifestStatus::Added)
-                .data_file(data_file.clone());
+                .data_file(file.clone());
             let entry = if format_version == FormatVersion::V1 {
                 // V1 requires snapshot_id on each entry.
                 entry_builder.snapshot_id(snapshot_id).build()
@@ -605,6 +670,9 @@ impl MergingSnapshotProducer {
                 .unwrap_or(TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT),
         );
         for file in &self.added_data_files {
+            collector.add_file(file, schema.clone(), partition_spec.clone());
+        }
+        for file in &self.added_delete_files {
             collector.add_file(file, schema.clone(), partition_spec.clone());
         }
 
